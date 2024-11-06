@@ -18,6 +18,7 @@ use nom::number::complete::u8;
 use nom::sequence::pair;
 use nom::{error_position, IResult};
 use num_traits::FromPrimitive;
+use std::ffi::CStr;
 use std::io::Read;
 
 // https://www.mathworks.com/help/pdf_doc/matlab/matfile_format.pdf
@@ -95,9 +96,90 @@ pub enum DataElement {
     ),
     // CharacterMatrix,
     // Cell Matrix,
-    // Structure Matrix,
+    StructureMatrix(Structure),
     // Object Matrix,
     Unsupported,
+}
+
+#[derive(Clone, Debug)]
+pub struct Structure {
+    pub(crate) flags: ArrayFlags,
+    pub(crate) dimensions: Dimensions,
+    pub(crate) name: String,
+    pub(crate) field_names: Vec<String>,
+    pub(crate) values: Vec<DataElement>,
+}
+
+impl Structure {
+    pub fn new(flags: ArrayFlags, dimensions: Dimensions, name: String) -> Self {
+        Structure {
+            flags,
+            dimensions,
+            name,
+            field_names: Vec::new(),
+            values: Vec::new(),
+        }
+    }
+
+    pub fn flags(&self) -> ArrayFlags {
+        self.flags
+    }
+
+    pub fn dimensions(&self) -> &Dimensions {
+        &self.dimensions
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn index(&self, name: &str) -> Option<usize> {
+        // unindexed search, let's assume that structures are small
+        self.field_names.iter().position(|v| v == name)
+    }
+
+    pub fn len(&self) -> usize {
+        self.field_names.len()
+    }
+
+    pub fn field_names(&self) -> impl Iterator<Item = &str> {
+        self.field_names.iter().map(|v| &**v)
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &DataElement> {
+        self.values.iter()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &DataElement)> {
+        self.field_names().zip(self.values())
+    }
+
+    pub fn get(&self, name: &str) -> Option<&DataElement> {
+        let idx = self.index(name)?;
+        Some(&self.values[idx])
+    }
+
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut DataElement> {
+        let idx = self.index(name)?;
+        Some(&mut self.values[idx])
+    }
+
+    pub fn insert(&mut self, name: &str, v: DataElement) -> Option<DataElement> {
+        match self.index(name) {
+            Some(idx) => Some(std::mem::replace(&mut self.values[idx], v)),
+            None => {
+                self.field_names.push(name.to_string());
+                self.values.push(v);
+                None
+            }
+        }
+    }
+
+    pub fn remove(&mut self, name: &str) -> Option<DataElement> {
+        let idx = self.index(name)?;
+        self.field_names.remove(idx);
+        Some(self.values.remove(idx))
+    }
 }
 
 // #[cfg(feature = "ndarray")]
@@ -150,12 +232,20 @@ fn constant<T: Clone>(v: T) -> impl Fn(&[u8]) -> IResult<&[u8], T> {
 
 fn parse_next_data_element(
     endianness: nom::number::Endianness,
-) -> impl Fn(&[u8]) -> IResult<&[u8], DataElement> {
+    name: Option<&str>,
+) -> impl Fn(&[u8]) -> IResult<&[u8], DataElement> + '_ {
     move |i: &[u8]| {
         let (i, data_element_tag) = parse_data_element_tag(endianness)(i)?;
         let next_parser: Box<dyn Fn(_) -> _> = match data_element_tag.data_type {
-            DataType::Matrix => Box::new(parse_matrix_data_element(endianness)),
-            DataType::Compressed => Box::new(parse_compressed_data_element(endianness)),
+            DataType::Matrix => Box::new(parse_matrix_data_element(endianness, name)),
+            DataType::Compressed => {
+                if name.is_some() {
+                    // only supplied for struct fields, and they are always Matrix
+                    unreachable!();
+                }
+
+                Box::new(parse_compressed_data_element(endianness))
+            }
             _ => {
                 println!(
                     "Unsupported variable type: {:?} (must be Matrix or Compressed)",
@@ -330,16 +420,22 @@ fn parse_data_element_tag(
 
 fn parse_array_name_subelement(
     endianness: nom::number::Endianness,
-) -> impl Fn(&[u8]) -> IResult<&[u8], String> {
+) -> impl Fn(&[u8]) -> IResult<&[u8], Option<String>> {
     move |i: &[u8]| {
         let (i, data_element_tag) = parse_data_element_tag(endianness)(i)?;
-        if !(data_element_tag.data_type == DataType::Int8 && data_element_tag.data_byte_size > 0) {
+
+        if data_element_tag.data_type != DataType::Int8 {
             return Err(nom::Err::Failure(error_position!(
                 i,
                 // TODO
                 nom::error::ErrorKind::Tag
             )));
         }
+
+        if data_element_tag.data_byte_size == 0 {
+            return Ok((i, None));
+        }
+
         let (i, name) = map_res(take(data_element_tag.data_byte_size), |b| {
             std::str::from_utf8(b)
                 .map(|s| s.to_owned())
@@ -349,7 +445,28 @@ fn parse_array_name_subelement(
         })(i)?;
         // Padding bytes
         let (i, _) = take(data_element_tag.padding_byte_size)(i)?;
-        Ok((i, name))
+        Ok((i, Some(name)))
+    }
+}
+
+fn maybe_parse_array_name_subelement(
+    endianness: nom::number::Endianness,
+    supplied_name: Option<&str>,
+) -> impl Fn(&[u8]) -> IResult<&[u8], String> + '_ {
+    move |i| {
+        let (i, element_name) = parse_array_name_subelement(endianness)(i)?;
+
+        match (supplied_name, element_name) {
+            (None, Some(v)) => Ok((i, v)),
+            (Some(v), None) => Ok((i, v.to_string())),
+            _ => {
+                return Err(nom::Err::Failure(error_position!(
+                    i,
+                    // TODO
+                    nom::error::ErrorKind::Tag
+                )));
+            }
+        }
     }
 }
 
@@ -392,6 +509,7 @@ fn parse_array_flags_subelement(
         }
         let (i, flags_and_class) = u32(endianness)(i)?;
         let (i, nzmax) = u32(endianness)(i)?;
+
         Ok((
             i,
             ArrayFlags {
@@ -412,15 +530,20 @@ fn parse_array_flags_subelement(
 
 fn parse_matrix_data_element(
     endianness: nom::number::Endianness,
-) -> impl Fn(&[u8]) -> IResult<&[u8], DataElement> {
+    supplied_name: Option<&str>,
+) -> impl Fn(&[u8]) -> IResult<&[u8], DataElement> + '_ {
     move |i: &[u8]| {
         let (i, flags) = parse_array_flags_subelement(endianness)(i)?;
         match flags.class {
-            ArrayType::Cell | ArrayType::Struct | ArrayType::Object | ArrayType::Char => {
+            ArrayType::Cell | ArrayType::Object | ArrayType::Char => {
                 parse_unsupported_data_element(endianness)(i)
             }
-            ArrayType::Sparse => parse_sparse_matrix_subelements(endianness, flags)(i),
-            _ => parse_numeric_matrix_subelements(endianness, flags)(i),
+            ArrayType::Struct => parse_struct(endianness, flags, supplied_name)(i)
+                .map(|(i, v)| (i, DataElement::StructureMatrix(v))),
+            ArrayType::Sparse => {
+                parse_sparse_matrix_subelements(endianness, flags, supplied_name)(i)
+            }
+            _ => parse_numeric_matrix_subelements(endianness, flags, supplied_name)(i),
         }
     }
 }
@@ -596,7 +719,7 @@ fn parse_compressed_data_element(
                     code: nom::error::ErrorKind::Tag,
                 }) // TODO
             })?;
-        let (_remaining, data_element) = parse_next_data_element(endianness)(buf.as_slice())
+        let (_remaining, data_element) = parse_next_data_element(endianness, None)(buf.as_slice())
             .map_err(|err| replace_err_slice(err, i))?;
         Ok((&[], data_element))
     }
@@ -608,10 +731,11 @@ pub type ColumnShift = Vec<usize>;
 fn parse_numeric_matrix_subelements(
     endianness: nom::number::Endianness,
     flags: ArrayFlags,
-) -> impl Fn(&[u8]) -> IResult<&[u8], DataElement> {
+    supplied_name: Option<&str>,
+) -> impl Fn(&[u8]) -> IResult<&[u8], DataElement> + '_ {
     move |i: &[u8]| {
         let (i, dimensions) = parse_dimensions_array_subelement(endianness)(i)?;
-        let (i, name) = parse_array_name_subelement(endianness)(i)?;
+        let (i, name) = maybe_parse_array_name_subelement(endianness, supplied_name)(i)?;
         let (i, real_part) = parse_numeric_subelement(endianness)(i)?;
         // Check that size and type of the real part are correct
         let num_required_elements = dimensions.iter().product::<i32>();
@@ -648,11 +772,12 @@ fn parse_numeric_matrix_subelements(
 fn parse_sparse_matrix_subelements(
     endianness: nom::number::Endianness,
     flags: ArrayFlags,
-) -> impl Fn(&[u8]) -> IResult<&[u8], DataElement> {
+    supplied_name: Option<&str>,
+) -> impl Fn(&[u8]) -> IResult<&[u8], DataElement> + '_ {
     move |i: &[u8]| {
         // Figure out the type of array
         let (i, dimensions) = parse_dimensions_array_subelement(endianness)(i)?;
-        let (i, name) = parse_array_name_subelement(endianness)(i)?;
+        let (i, name) = maybe_parse_array_name_subelement(endianness, supplied_name)(i)?;
         let (i, row_index) = parse_row_index_array_subelement(endianness)(i)?;
         let (i, column_index) = parse_column_index_array_subelement(endianness)(i)?;
         let (i, real_part) = parse_numeric_subelement(endianness)(i)?;
@@ -749,6 +874,148 @@ pub fn replace_err_slice<'old, 'new>(
     }
 }
 
+fn parse_struct(
+    endianness: nom::number::Endianness,
+    flags: ArrayFlags,
+    supplied_name: Option<&str>,
+) -> impl Fn(&[u8]) -> IResult<&[u8], Structure> + '_ {
+    move |i| {
+        let (i, dimensions) = parse_dimensions_array_subelement(endianness)(i)?;
+        let (i, name) = maybe_parse_array_name_subelement(endianness, supplied_name)(i)?;
+        let (i, max_length) = parse_struct_field_name_length(endianness)(i)?;
+        let (i, field_names) = parse_struct_names(endianness, max_length)(i)?;
+        let (i, values) = parse_struct_fields(endianness, &field_names)(i)?;
+
+        Ok((
+            i,
+            Structure {
+                flags,
+                dimensions,
+                name,
+                field_names,
+                values,
+            },
+        ))
+    }
+}
+
+fn parse_struct_field_name_length(
+    endianness: nom::number::Endianness,
+) -> impl Fn(&[u8]) -> IResult<&[u8], usize> {
+    move |i| {
+        let (i, numeric) = parse_numeric_subelement(endianness)(i)?;
+
+        match numeric {
+            NumericData::Int8(vec) => {
+                assert!(vec.len() == 1);
+                Ok((i, vec[0] as usize))
+            }
+            NumericData::UInt8(vec) => {
+                assert!(vec.len() == 1);
+                Ok((i, vec[0] as usize))
+            }
+            NumericData::Int16(vec) => {
+                assert!(vec.len() == 1);
+                Ok((i, vec[0] as usize))
+            }
+            NumericData::UInt16(vec) => {
+                assert!(vec.len() == 1);
+                Ok((i, vec[0] as usize))
+            }
+            NumericData::Int32(vec) => {
+                assert!(vec.len() == 1);
+                Ok((i, vec[0] as usize))
+            }
+            NumericData::UInt32(vec) => {
+                assert!(vec.len() == 1);
+                Ok((i, vec[0] as usize))
+            }
+            NumericData::Int64(vec) => {
+                assert!(vec.len() == 1);
+                Ok((i, vec[0] as usize))
+            }
+            NumericData::UInt64(vec) => {
+                assert!(vec.len() == 1);
+                Ok((i, vec[0] as usize))
+            }
+            NumericData::Single(_) | NumericData::Double(_) => todo!(),
+        }
+    }
+}
+
+fn parse_struct_names(
+    endianness: nom::number::Endianness,
+    max_length: usize,
+) -> impl Fn(&[u8]) -> IResult<&[u8], Vec<String>> {
+    move |i| {
+        let (i, data_element_tag) = parse_data_element_tag(endianness)(i)?;
+
+        if !(data_element_tag.data_type == DataType::Int8 && data_element_tag.data_byte_size > 0) {
+            return Err(nom::Err::Failure(error_position!(
+                i,
+                // TODO
+                nom::error::ErrorKind::Tag
+            )));
+        }
+
+        let (i, data) = count(u8, data_element_tag.data_byte_size as usize)(i)?;
+        let (i, _) = take(data_element_tag.padding_byte_size)(i)?;
+
+        let value_count = data.len() / max_length;
+        let mut result = Vec::with_capacity(value_count);
+
+        for idx in 0..value_count {
+            let buf = &data[max_length * idx..][..max_length];
+
+            let Ok(v) = CStr::from_bytes_until_nul(&buf) else {
+                return Err(nom::Err::Failure(error_position!(
+                    i,
+                    // TODO
+                    nom::error::ErrorKind::Tag
+                )));
+            };
+
+            let Ok(str) = v.to_str() else {
+                return Err(nom::Err::Failure(error_position!(
+                    i,
+                    // TODO
+                    nom::error::ErrorKind::Tag
+                )));
+            };
+
+            result.push(str.to_string());
+        }
+
+        Ok((i, result))
+    }
+}
+
+fn parse_struct_field(
+    endianness: nom::number::Endianness,
+    name: &str,
+) -> impl Fn(&[u8]) -> IResult<&[u8], DataElement> + '_ {
+    parse_next_data_element(endianness, Some(name))
+}
+
+fn parse_struct_fields(
+    endianness: nom::number::Endianness,
+    names: &[String],
+) -> impl Fn(&[u8]) -> IResult<&[u8], Vec<DataElement>> + '_ {
+    move |i| {
+        let mut result = Vec::with_capacity(names.len());
+
+        let mut i = i;
+
+        for name in names {
+            let (j, val) = parse_struct_field(endianness, name)(i)?;
+            result.push(val);
+            i = j;
+        }
+
+        Ok((i, result))
+    }
+}
+
 fn parse_unsupported_data_element(
     _endianness: nom::number::Endianness,
 ) -> impl Fn(&[u8]) -> IResult<&[u8], DataElement> {
@@ -768,7 +1035,7 @@ pub fn parse_all(i: &[u8]) -> IResult<&[u8], ParseResult> {
     } else {
         nom::number::Endianness::Big
     };
-    let (i, data_elements) = many0(complete(parse_next_data_element(endianness)))(i)?;
+    let (i, data_elements) = many0(complete(parse_next_data_element(endianness, None)))(i)?;
     Ok((
         i,
         ParseResult {

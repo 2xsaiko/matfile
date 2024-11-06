@@ -59,6 +59,8 @@
 //! * `ndarray`
 //!   * Enable conversions between Matfile and `ndarray` array types
 
+use std::convert::{TryFrom, TryInto};
+
 #[macro_use]
 extern crate enum_primitive_derive;
 
@@ -81,6 +83,12 @@ pub struct MatFile {
     arrays: Vec<Array>,
 }
 
+#[derive(Clone, Debug)]
+pub enum Array {
+    Numeric(Numeric),
+    Structure(Structure),
+}
+
 /// A numeric array (the only type supported at the moment).
 ///
 /// You can access the arrays of a MatFile either by name or by iterating
@@ -100,10 +108,16 @@ pub struct MatFile {
 /// # }
 /// ```
 #[derive(Clone, Debug)]
-pub struct Array {
+pub struct Numeric {
     name: String,
     size: Vec<usize>,
     data: NumericData,
+}
+
+#[derive(Clone, Debug)]
+pub struct Structure {
+    name: String,
+    values: Vec<Array>,
 }
 
 /// Stores the data of a numerical array and abstracts over the actual data
@@ -278,6 +292,15 @@ fn try_convert_number_format(
     }
 }
 
+impl Array {
+    pub fn name(&self) -> &str {
+        match self {
+            Array::Numeric(numeric) => &numeric.name,
+            Array::Structure(structure) => &structure.name,
+        }
+    }
+}
+
 impl NumericData {
     fn try_from(
         target_type: parse::ArrayType,
@@ -402,6 +425,7 @@ pub enum Error {
     ParseError(nom::Err<nom::error::Error<&'static [u8]>>),
     ConversionError,
     InternalError,
+    Unsupported,
 }
 
 impl std::fmt::Display for Error {
@@ -413,6 +437,7 @@ impl std::fmt::Display for Error {
                 write!(f, "An error occurred while converting number formats")
             }
             Error::InternalError => write!(f, "An internal error occurred, this is a bug"),
+            Error::Unsupported => write!(f, "Tried to load unsupported array type"),
         }
     }
 }
@@ -426,7 +451,7 @@ impl std::error::Error for Error {
     }
 }
 
-impl Array {
+impl Numeric {
     /// The name of this array.
     pub fn name(&self) -> &str {
         &self.name
@@ -468,6 +493,53 @@ impl Array {
     }
 }
 
+impl TryFrom<parse::DataElement> for Array {
+    type Error = Error;
+
+    fn try_from(value: parse::DataElement) -> Result<Self, Self::Error> {
+        match value {
+            parse::DataElement::NumericMatrix(flags, dims, name, real, imag) => {
+                let size = dims.into_iter().map(|d| d as usize).collect();
+                let numeric_data = match NumericData::try_from(flags.class, real, imag) {
+                    Ok(numeric_data) => numeric_data,
+                    Err(err) => return Err(err),
+                };
+                Ok(Array::Numeric(Numeric {
+                    size: size,
+                    name: name,
+                    data: numeric_data,
+                }))
+            }
+            parse::DataElement::StructureMatrix(structure) => {
+                let mut values = Vec::with_capacity(structure.values.len());
+
+                for item in structure.values {
+                    let item = match item.try_into() {
+                        Ok(v) => v,
+                        Err(Error::Unsupported) => continue,
+                        Err(e) => return Err(e),
+                    };
+
+                    values.push(item);
+                }
+
+                Ok(Array::Structure(Structure {
+                    name: structure.name,
+                    values,
+                }))
+            }
+            parse::DataElement::Unsupported => {
+                eprintln!("skipping unsupported array");
+                Err(Error::Unsupported)
+            }
+            x => {
+                panic!("{:?}", x);
+                //Err(Error::Unsupported)
+            }
+        }
+    }
+}
+
 impl MatFile {
     /// Tries to parse a byte sequence as a ".mat" file.
     pub fn parse<R: std::io::Read>(mut reader: R) -> Result<Self, Error> {
@@ -480,24 +552,13 @@ impl MatFile {
         let arrays: Result<Vec<Array>, Error> = parse_result
             .data_elements
             .into_iter()
-            .filter_map(|data_element| match data_element {
-                parse::DataElement::NumericMatrix(flags, dims, name, real, imag) => {
-                    let size = dims.into_iter().map(|d| d as usize).collect();
-                    let numeric_data = match NumericData::try_from(flags.class, real, imag) {
-                        Ok(numeric_data) => numeric_data,
-                        Err(err) => return Some(Err(err)),
-                    };
-                    Some(Ok(Array {
-                        size: size,
-                        name: name,
-                        data: numeric_data,
-                    }))
-                }
-                _ => None,
+            .filter_map(|data_element| match data_element.try_into() {
+                Err(Error::Unsupported) => None,
+                res => Some(res),
             })
             .collect();
         let arrays = arrays?;
-        Ok(MatFile { arrays: arrays })
+        Ok(MatFile { arrays })
     }
 
     /// List of all arrays in this .mat file.
@@ -505,7 +566,7 @@ impl MatFile {
     /// When parsing a .mat file all arrays of unsupported type (currently all
     /// non-numerical and sparse arrays) will be ignored and will thus not be
     /// part of this list.
-    pub fn arrays(&self) -> &Vec<Array> {
+    pub fn arrays(&self) -> &[Array] {
         &self.arrays
     }
 
@@ -516,7 +577,7 @@ impl MatFile {
     /// returned by this function.
     pub fn find_by_name<'me>(&'me self, name: &'_ str) -> Option<&'me Array> {
         for array in &self.arrays {
-            if array.name == name {
+            if array.name() == name {
                 return Some(array);
             }
         }
