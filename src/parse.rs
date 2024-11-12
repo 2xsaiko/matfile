@@ -530,21 +530,21 @@ fn parse_matrix_data_element(
     supplied_name: Option<&str>,
 ) -> impl Fn(&[u8]) -> IResult<&[u8], DataElement> + '_ {
     move |i: &[u8]| {
-        let (i, flags) = parse_array_flags_subelement(endianness)(i)?;
-        match flags.class {
+        let (i, header) = parse_array_header(endianness, supplied_name)(i)?;
+        match header.flags.class {
             ArrayType::Cell | ArrayType::Object | ArrayType::Char => {
-                eprintln!("skipping unsupported {:?}", flags.class);
+                eprintln!("skipping unsupported {:?}", header.flags.class);
                 parse_unsupported_data_element(endianness)(i)
             }
             // ArrayType::Char => {
             //     parse_char(endianness, flags, supplied_name)(i);
             // }
-            ArrayType::Struct => parse_struct(endianness, flags, supplied_name)(i)
+            ArrayType::Struct => parse_struct(endianness, header)(i)
                 .map(|(i, v)| (i, DataElement::StructureMatrix(v))),
             ArrayType::Sparse => {
-                parse_sparse_matrix_subelements(endianness, flags, supplied_name)(i)
+                parse_sparse_matrix_subelements(endianness, header)(i)
             }
-            _ => parse_numeric_matrix_subelements(endianness, flags, supplied_name)(i),
+            _ => parse_numeric_matrix_subelements(endianness, header)(i),
         }
     }
 }
@@ -731,15 +731,13 @@ pub type ColumnShift = Vec<usize>;
 
 fn parse_numeric_matrix_subelements(
     endianness: nom::number::Endianness,
-    flags: ArrayFlags,
-    supplied_name: Option<&str>,
-) -> impl Fn(&[u8]) -> IResult<&[u8], DataElement> + '_ {
+    header: ArrayHeader,
+) -> impl FnOnce(&[u8]) -> IResult<&[u8], DataElement> {
     move |i: &[u8]| {
-        let (i, header) = parse_array_header(endianness, flags, supplied_name)(i)?;
         let (i, real_part) = parse_numeric_subelement(endianness)(i)?;
         // Check that size and type of the real part are correct
         let num_required_elements = header.dimensions.iter().product::<i32>();
-        let array_data_type = flags.class.numeric_data_type().unwrap();
+        let array_data_type = header.flags.class.numeric_data_type().unwrap();
         if !(real_part.len() == num_required_elements as usize
             && numeric_data_types_are_compatible(array_data_type, real_part.data_type()))
         {
@@ -749,7 +747,7 @@ fn parse_numeric_matrix_subelements(
                 nom::error::ErrorKind::Tag
             )));
         }
-        let (i, imag_part) = cond(flags.complex, parse_numeric_subelement(endianness))(i)?;
+        let (i, imag_part) = cond(header.flags.complex, parse_numeric_subelement(endianness))(i)?;
         // Check that size and type of imaginary part are correct if present
         if let Some(imag_part) = &imag_part {
             if !(imag_part.len() == num_required_elements as usize
@@ -775,27 +773,25 @@ fn parse_numeric_matrix_subelements(
 
 fn parse_sparse_matrix_subelements(
     endianness: nom::number::Endianness,
-    flags: ArrayFlags,
-    supplied_name: Option<&str>,
-) -> impl Fn(&[u8]) -> IResult<&[u8], DataElement> + '_ {
+    header: ArrayHeader,
+) -> impl FnOnce(&[u8]) -> IResult<&[u8], DataElement> {
     move |i: &[u8]| {
         // Figure out the type of array
-        let (i, header) = parse_array_header(endianness, flags, supplied_name)(i)?;
         let (i, row_index) = parse_row_index_array_subelement(endianness)(i)?;
         let (i, column_index) = parse_column_index_array_subelement(endianness)(i)?;
         let (i, real_part) = parse_numeric_subelement(endianness)(i)?;
         // Check that size of the real part is correct (can't check for type in sparse matrices)
-        if !(real_part.len() == flags.nzmax) {
+        if !(real_part.len() == header.flags.nzmax) {
             return Err(nom::Err::Failure(error_position!(
                 i,
                 // TODO
                 nom::error::ErrorKind::Tag
             )));
         }
-        let (i, imag_part) = cond(flags.complex, parse_numeric_subelement(endianness))(i)?;
+        let (i, imag_part) = cond(header.flags.complex, parse_numeric_subelement(endianness))(i)?;
         // Check that size of the imaginary part is correct if present (can't check for type in sparse matrices)
         if let Some(imag_part) = &imag_part {
-            if !(imag_part.len() == flags.nzmax as usize) {
+            if !(imag_part.len() == header.flags.nzmax as usize) {
                 return Err(nom::Err::Failure(error_position!(
                     i,
                     // TODO
@@ -806,7 +802,7 @@ fn parse_sparse_matrix_subelements(
         Ok((
             i,
             DataElement::SparseMatrix(Sparse {
-                header: header,
+                header,
                 row_index: row_index.iter().map(|&i| i as usize).collect(),
                 column_index: column_index.iter().map(|&i| i as usize).collect(),
                 real_part,
@@ -877,10 +873,10 @@ pub fn replace_err_slice<'old, 'new>(
 
 fn parse_array_header(
     endianness: nom::number::Endianness,
-    flags: ArrayFlags,
     supplied_name: Option<&str>,
 ) -> impl Fn(&[u8]) -> IResult<&[u8], ArrayHeader> + '_ {
     move |i| {
+        let (i, flags) = parse_array_flags_subelement(endianness)(i)?;
         let (i, dimensions) = parse_dimensions_array_subelement(endianness)(i)?;
         let (i, name) = maybe_parse_array_name_subelement(endianness, supplied_name)(i)?;
 
@@ -897,11 +893,9 @@ fn parse_array_header(
 
 fn parse_struct(
     endianness: nom::number::Endianness,
-    flags: ArrayFlags,
-    supplied_name: Option<&str>,
-) -> impl Fn(&[u8]) -> IResult<&[u8], Structure> + '_ {
+    header: ArrayHeader,
+) -> impl FnOnce(&[u8]) -> IResult<&[u8], Structure> {
     move |i| {
-        let (i, header) = parse_array_header(endianness, flags, supplied_name)(i)?;
         let (i, max_length) = parse_struct_field_name_length(endianness)(i)?;
         let (i, field_names) = parse_struct_names(endianness, max_length)(i)?;
         let (i, values) = parse_struct_fields(endianness, &field_names)(i)?;
