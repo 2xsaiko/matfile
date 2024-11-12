@@ -78,22 +78,8 @@ impl NumericData {
 
 #[derive(Clone, Debug)]
 pub enum DataElement {
-    NumericMatrix(
-        ArrayFlags,
-        Dimensions,
-        String,
-        NumericData,
-        Option<NumericData>,
-    ),
-    SparseMatrix(
-        ArrayFlags,
-        Dimensions,
-        String,
-        RowIndex,
-        ColumnShift,
-        NumericData,
-        Option<NumericData>,
-    ),
+    NumericMatrix(Numeric),
+    SparseMatrix(Sparse),
     // CharacterMatrix,
     // Cell Matrix,
     StructureMatrix(Structure),
@@ -102,35 +88,46 @@ pub enum DataElement {
 }
 
 #[derive(Clone, Debug)]
+pub struct ArrayHeader {
+    pub flags: ArrayFlags,
+    pub dimensions: Dimensions,
+    pub name: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct Numeric {
+    pub header: ArrayHeader,
+    pub real_part: NumericData,
+    pub imag_part: Option<NumericData>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Sparse {
+    pub header: ArrayHeader,
+    pub row_index: RowIndex,
+    pub column_index: ColumnShift,
+    pub real_part: NumericData,
+    pub imag_part: Option<NumericData>,
+}
+
+#[derive(Clone, Debug)]
 pub struct Structure {
-    pub(crate) flags: ArrayFlags,
-    pub(crate) dimensions: Dimensions,
-    pub(crate) name: String,
-    pub(crate) field_names: Vec<String>,
-    pub(crate) values: Vec<DataElement>,
+    pub header: ArrayHeader,
+    pub field_names: Vec<String>,
+    pub values: Vec<DataElement>,
 }
 
 impl Structure {
-    pub fn new(flags: ArrayFlags, dimensions: Dimensions, name: String) -> Self {
+    pub fn new(header: ArrayHeader) -> Self {
         Structure {
-            flags,
-            dimensions,
-            name,
+            header,
             field_names: Vec::new(),
             values: Vec::new(),
         }
     }
 
-    pub fn flags(&self) -> ArrayFlags {
-        self.flags
-    }
-
-    pub fn dimensions(&self) -> &Dimensions {
-        &self.dimensions
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
+    pub fn header(&self) -> &ArrayHeader {
+        &self.header
     }
 
     fn index(&self, name: &str) -> Option<usize> {
@@ -536,8 +533,12 @@ fn parse_matrix_data_element(
         let (i, flags) = parse_array_flags_subelement(endianness)(i)?;
         match flags.class {
             ArrayType::Cell | ArrayType::Object | ArrayType::Char => {
+                eprintln!("skipping unsupported {:?}", flags.class);
                 parse_unsupported_data_element(endianness)(i)
             }
+            // ArrayType::Char => {
+            //     parse_char(endianness, flags, supplied_name)(i);
+            // }
             ArrayType::Struct => parse_struct(endianness, flags, supplied_name)(i)
                 .map(|(i, v)| (i, DataElement::StructureMatrix(v))),
             ArrayType::Sparse => {
@@ -734,11 +735,10 @@ fn parse_numeric_matrix_subelements(
     supplied_name: Option<&str>,
 ) -> impl Fn(&[u8]) -> IResult<&[u8], DataElement> + '_ {
     move |i: &[u8]| {
-        let (i, dimensions) = parse_dimensions_array_subelement(endianness)(i)?;
-        let (i, name) = maybe_parse_array_name_subelement(endianness, supplied_name)(i)?;
+        let (i, header) = parse_array_header(endianness, flags, supplied_name)(i)?;
         let (i, real_part) = parse_numeric_subelement(endianness)(i)?;
         // Check that size and type of the real part are correct
-        let num_required_elements = dimensions.iter().product::<i32>();
+        let num_required_elements = header.dimensions.iter().product::<i32>();
         let array_data_type = flags.class.numeric_data_type().unwrap();
         if !(real_part.len() == num_required_elements as usize
             && numeric_data_types_are_compatible(array_data_type, real_part.data_type()))
@@ -764,7 +764,11 @@ fn parse_numeric_matrix_subelements(
         }
         Ok((
             i,
-            DataElement::NumericMatrix(flags, dimensions, name, real_part, imag_part),
+            DataElement::NumericMatrix(Numeric {
+                header,
+                real_part,
+                imag_part,
+            }),
         ))
     }
 }
@@ -776,8 +780,7 @@ fn parse_sparse_matrix_subelements(
 ) -> impl Fn(&[u8]) -> IResult<&[u8], DataElement> + '_ {
     move |i: &[u8]| {
         // Figure out the type of array
-        let (i, dimensions) = parse_dimensions_array_subelement(endianness)(i)?;
-        let (i, name) = maybe_parse_array_name_subelement(endianness, supplied_name)(i)?;
+        let (i, header) = parse_array_header(endianness, flags, supplied_name)(i)?;
         let (i, row_index) = parse_row_index_array_subelement(endianness)(i)?;
         let (i, column_index) = parse_column_index_array_subelement(endianness)(i)?;
         let (i, real_part) = parse_numeric_subelement(endianness)(i)?;
@@ -802,15 +805,13 @@ fn parse_sparse_matrix_subelements(
         }
         Ok((
             i,
-            DataElement::SparseMatrix(
-                flags,
-                dimensions,
-                name,
-                row_index.iter().map(|&i| i as usize).collect(),
-                column_index.iter().map(|&i| i as usize).collect(),
+            DataElement::SparseMatrix(Sparse {
+                header: header,
+                row_index: row_index.iter().map(|&i| i as usize).collect(),
+                column_index: column_index.iter().map(|&i| i as usize).collect(),
                 real_part,
                 imag_part,
-            ),
+            }),
         ))
     }
 }
@@ -874,14 +875,33 @@ pub fn replace_err_slice<'old, 'new>(
     }
 }
 
+fn parse_array_header(
+    endianness: nom::number::Endianness,
+    flags: ArrayFlags,
+    supplied_name: Option<&str>,
+) -> impl Fn(&[u8]) -> IResult<&[u8], ArrayHeader> + '_ {
+    move |i| {
+        let (i, dimensions) = parse_dimensions_array_subelement(endianness)(i)?;
+        let (i, name) = maybe_parse_array_name_subelement(endianness, supplied_name)(i)?;
+
+        Ok((
+            i,
+            ArrayHeader {
+                flags,
+                dimensions,
+                name,
+            },
+        ))
+    }
+}
+
 fn parse_struct(
     endianness: nom::number::Endianness,
     flags: ArrayFlags,
     supplied_name: Option<&str>,
 ) -> impl Fn(&[u8]) -> IResult<&[u8], Structure> + '_ {
     move |i| {
-        let (i, dimensions) = parse_dimensions_array_subelement(endianness)(i)?;
-        let (i, name) = maybe_parse_array_name_subelement(endianness, supplied_name)(i)?;
+        let (i, header) = parse_array_header(endianness, flags, supplied_name)(i)?;
         let (i, max_length) = parse_struct_field_name_length(endianness)(i)?;
         let (i, field_names) = parse_struct_names(endianness, max_length)(i)?;
         let (i, values) = parse_struct_fields(endianness, &field_names)(i)?;
@@ -889,9 +909,7 @@ fn parse_struct(
         Ok((
             i,
             Structure {
-                flags,
-                dimensions,
-                name,
+                header,
                 field_names,
                 values,
             },
@@ -1055,17 +1073,22 @@ mod test {
 
         let (_, parsed_data) = parse_all(data).unwrap();
         let parsed_matrix_data = parsed_data.data_elements[0].clone();
-        if let DataElement::SparseMatrix(_flags, dim, _name, irows, icols, real_vals, imag_vals) =
-            parsed_matrix_data
+        if let DataElement::SparseMatrix(Sparse {
+            header,
+            row_index,
+            column_index,
+            real_part,
+            imag_part,
+        }) = parsed_matrix_data
         {
-            assert_eq!(dim, vec![8, 8]);
-            assert_eq!(irows, vec![5, 7, 2, 0, 1, 3, 6]);
-            assert_eq!(icols, vec![0, 1, 2, 2, 3, 4, 5, 6, 7]);
+            assert_eq!(header.dimensions, vec![8, 8]);
+            assert_eq!(row_index, vec![5, 7, 2, 0, 1, 3, 6]);
+            assert_eq!(column_index, vec![0, 1, 2, 2, 3, 4, 5, 6, 7]);
             assert_eq!(
-                real_vals,
+                real_part,
                 NumericData::Double(vec![2.0, 7.0, 4.0, 9.0, 5.0, 8.0, 6.0])
             );
-            assert_eq!(imag_vals, None);
+            assert_eq!(imag_part, None);
         } else {
             panic!("Error extracting DataElement::SparseMatrix");
         }
@@ -1077,18 +1100,23 @@ mod test {
 
         let (_, parsed_data) = parse_all(data).unwrap();
         let parsed_matrix_data = parsed_data.data_elements[0].clone();
-        if let DataElement::SparseMatrix(_flags, dim, _name, irows, icols, real_vals, imag_vals) =
-            parsed_matrix_data
+        if let DataElement::SparseMatrix(Sparse {
+            header,
+            row_index,
+            column_index,
+            real_part,
+            imag_part,
+        }) = parsed_matrix_data
         {
-            assert_eq!(dim, vec![8, 8]);
-            assert_eq!(irows, vec![5, 7, 2, 0, 1, 5, 3, 6]);
-            assert_eq!(icols, vec![0, 1, 2, 2, 3, 4, 6, 7, 8]);
+            assert_eq!(header.dimensions, vec![8, 8]);
+            assert_eq!(row_index, vec![5, 7, 2, 0, 1, 5, 3, 6]);
+            assert_eq!(column_index, vec![0, 1, 2, 2, 3, 4, 6, 7, 8]);
             assert_eq!(
-                real_vals,
+                real_part,
                 NumericData::Double(vec![2.0, 7.0, 4.0, 9.0, 5.0, 6.0, 8.0, 6.0])
             );
             assert_eq!(
-                imag_vals,
+                imag_part,
                 Some(NumericData::Double(vec![
                     4.0, 0.0, 3.0, 7.0, 0.0, 1.0, 0.0, 0.0
                 ]))

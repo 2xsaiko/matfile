@@ -498,15 +498,24 @@ impl TryFrom<parse::DataElement> for Array {
 
     fn try_from(value: parse::DataElement) -> Result<Self, Self::Error> {
         match value {
-            parse::DataElement::NumericMatrix(flags, dims, name, real, imag) => {
-                let size = dims.into_iter().map(|d| d as usize).collect();
-                let numeric_data = match NumericData::try_from(flags.class, real, imag) {
+            parse::DataElement::NumericMatrix(value) => {
+                let size = value
+                    .header
+                    .dimensions
+                    .into_iter()
+                    .map(|d| d as usize)
+                    .collect();
+                let numeric_data = match NumericData::try_from(
+                    value.header.flags.class,
+                    value.real_part,
+                    value.imag_part,
+                ) {
                     Ok(numeric_data) => numeric_data,
                     Err(err) => return Err(err),
                 };
                 Ok(Array::Numeric(Numeric {
-                    size: size,
-                    name: name,
+                    size,
+                    name: value.header.name,
                     data: numeric_data,
                 }))
             }
@@ -524,18 +533,12 @@ impl TryFrom<parse::DataElement> for Array {
                 }
 
                 Ok(Array::Structure(Structure {
-                    name: structure.name,
+                    name: structure.header.name,
                     values,
                 }))
             }
-            parse::DataElement::Unsupported => {
-                eprintln!("skipping unsupported array");
-                Err(Error::Unsupported)
-            }
-            x => {
-                panic!("{:?}", x);
-                //Err(Error::Unsupported)
-            }
+            parse::DataElement::Unsupported => Err(Error::Unsupported),
+            x => unimplemented!("{:?}", x),
         }
     }
 }
