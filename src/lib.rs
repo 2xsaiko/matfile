@@ -59,6 +59,7 @@
 //! * `ndarray`
 //!   * Enable conversions between Matfile and `ndarray` array types
 
+use std::borrow::Cow;
 use std::convert::{TryFrom, TryInto};
 
 #[macro_use]
@@ -86,6 +87,7 @@ pub struct MatFile {
 #[derive(Clone, Debug)]
 pub enum Array {
     Numeric(Numeric),
+    Character(Character),
     Structure(Structure),
 }
 
@@ -115,9 +117,56 @@ pub struct Numeric {
 }
 
 #[derive(Clone, Debug)]
+pub struct Character {
+    name: String,
+    size: Vec<usize>,
+    data: CharacterData,
+}
+
+impl Character {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The size of this array.
+    ///
+    /// The number of entries in this vector is equal to the number of
+    /// dimensions of this array. Each array has at least two dimensions.
+    /// For two-dimensional arrays the first dimension is the number of rows
+    /// while the second dimension is the number of columns.
+    pub fn size(&self) -> &Vec<usize> {
+        &self.size
+    }
+
+    /// The number of dimensions of this array. Is at least two.
+    pub fn ndims(&self) -> usize {
+        self.size.len()
+    }
+
+    /// The character data stored in this array.
+    pub fn data(&self) -> &CharacterData {
+        &self.data
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Structure {
     name: String,
     values: Vec<Array>,
+}
+
+impl Structure {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn arrays(&self) -> &[Array] {
+        &self.values
+    }
+
+    pub fn find_by_name(&self, name: &str) -> Option<&Array> {
+        self.values.iter().find(|v| v.name() == name)
+    }
 }
 
 /// Stores the data of a numerical array and abstracts over the actual data
@@ -169,6 +218,28 @@ pub enum NumericData {
         real: Vec<f64>,
         imag: Option<Vec<f64>>,
     },
+}
+
+#[derive(Clone, Debug)]
+pub enum CharacterData {
+    Unicode(String),
+    NonUnicode(Vec<u16>),
+}
+
+impl CharacterData {
+    pub fn to_str(&self) -> Option<Cow<str>> {
+        match self {
+            CharacterData::Unicode(v) => Some(v.as_str().into()),
+            CharacterData::NonUnicode(vec) => String::from_utf16(&vec).ok().map(Cow::Owned),
+        }
+    }
+
+    pub fn to_str_lossy(&self) -> Cow<str> {
+        match self {
+            CharacterData::Unicode(v) => v.as_str().into(),
+            CharacterData::NonUnicode(vec) => String::from_utf16_lossy(&vec).into(),
+        }
+    }
 }
 
 fn try_convert_number_format(
@@ -297,6 +368,7 @@ impl Array {
         match self {
             Array::Numeric(numeric) => &numeric.name,
             Array::Structure(structure) => &structure.name,
+            Array::Character(character) => &character.name,
         }
     }
 }
@@ -535,6 +607,27 @@ impl TryFrom<parse::DataElement> for Array {
                 Ok(Array::Structure(Structure {
                     name: structure.header.name,
                     values,
+                }))
+            }
+            parse::DataElement::CharacterMatrix(character) => {
+                let size = character
+                    .header
+                    .dimensions
+                    .iter()
+                    .map(|v| *v as usize)
+                    .collect();
+
+                assert!(character.imag_part.is_none());
+
+                let data = match character.real_part {
+                    parse::CharacterData::Unicode(v) => CharacterData::Unicode(v),
+                    parse::CharacterData::NonUnicode(vec) => CharacterData::NonUnicode(vec),
+                };
+
+                Ok(Array::Character(Character {
+                    name: character.header.name,
+                    size,
+                    data,
                 }))
             }
             parse::DataElement::Unsupported => Err(Error::Unsupported),

@@ -3,7 +3,7 @@ use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::bytes::complete::take;
 use nom::character::complete::char;
-use nom::combinator::{complete, cond, map, map_res, not, opt, peek, value};
+use nom::combinator::{complete, cond, eof, map, map_res, not, opt, peek, value};
 use nom::multi::{count, length_value, many0};
 use nom::number::complete::f32;
 use nom::number::complete::f64;
@@ -80,7 +80,7 @@ impl NumericData {
 pub enum DataElement {
     NumericMatrix(Numeric),
     SparseMatrix(Sparse),
-    // CharacterMatrix,
+    CharacterMatrix(Character),
     // Cell Matrix,
     StructureMatrix(Structure),
     // Object Matrix,
@@ -108,6 +108,19 @@ pub struct Sparse {
     pub column_index: ColumnShift,
     pub real_part: NumericData,
     pub imag_part: Option<NumericData>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Character {
+    pub header: ArrayHeader,
+    pub real_part: CharacterData,
+    pub imag_part: Option<CharacterData>,
+}
+
+#[derive(Clone, Debug)]
+pub enum CharacterData {
+    Unicode(String),
+    NonUnicode(Vec<u16>),
 }
 
 #[derive(Clone, Debug)]
@@ -532,19 +545,17 @@ fn parse_matrix_data_element(
     move |i: &[u8]| {
         let (i, header) = parse_array_header(endianness, supplied_name)(i)?;
         match header.flags.class {
-            ArrayType::Cell | ArrayType::Object | ArrayType::Char => {
+            ArrayType::Char => parse_character_array(endianness, header)(i),
+            ArrayType::Struct => parse_struct(endianness, header)(i)
+                .map(|(i, v)| (i, DataElement::StructureMatrix(v))),
+            ArrayType::Sparse => parse_sparse_matrix_subelements(endianness, header)(i),
+            x if x.numeric_data_type().is_some() => {
+                parse_numeric_matrix_subelements(endianness, header)(i)
+            }
+            _ => {
                 eprintln!("skipping unsupported {:?}", header.flags.class);
                 parse_unsupported_data_element(endianness)(i)
             }
-            // ArrayType::Char => {
-            //     parse_char(endianness, flags, supplied_name)(i);
-            // }
-            ArrayType::Struct => parse_struct(endianness, header)(i)
-                .map(|(i, v)| (i, DataElement::StructureMatrix(v))),
-            ArrayType::Sparse => {
-                parse_sparse_matrix_subelements(endianness, header)(i)
-            }
-            _ => parse_numeric_matrix_subelements(endianness, header)(i),
         }
     }
 }
@@ -768,6 +779,140 @@ fn parse_numeric_matrix_subelements(
                 imag_part,
             }),
         ))
+    }
+}
+
+fn parse_character_array(
+    endianness: nom::number::Endianness,
+    header: ArrayHeader,
+) -> impl FnOnce(&[u8]) -> IResult<&[u8], DataElement> {
+    move |i: &[u8]| {
+        let (i, real_part) = parse_character_array_data(endianness, &header.dimensions)(i)?;
+        let (i, imag_part) = cond(
+            header.flags.complex,
+            parse_character_array_data(endianness, &header.dimensions),
+        )(i)?;
+
+        Ok((
+            i,
+            DataElement::CharacterMatrix(Character {
+                header,
+                real_part,
+                imag_part,
+            }),
+        ))
+    }
+}
+
+fn parse_character_array_data(
+    endianness: nom::number::Endianness,
+    dimensions: &[i32],
+) -> impl Fn(&[u8]) -> IResult<&[u8], CharacterData> + '_ {
+    move |i| {
+        let (i, data_element_tag) = parse_data_element_tag(endianness)(i)?;
+
+        let cells = dimensions.iter().product::<i32>() as usize;
+
+        let (i, buf) = take(data_element_tag.data_byte_size)(i)?;
+
+        match data_element_tag.data_type {
+            DataType::UInt16 => {
+                assert!(data_element_tag.data_byte_size % 2 == 0);
+
+                let (rem, str) = count(u16(endianness), cells)(buf)?;
+
+                if !rem.is_empty() {
+                    return Err(nom::Err::Failure(error_position!(
+                        i,
+                        // TODO
+                        nom::error::ErrorKind::Tag
+                    )));
+                }
+
+                Ok((i, CharacterData::NonUnicode(str)))
+            }
+            DataType::Utf8 => {
+                let Ok(str) = String::from_utf8(buf.to_vec()) else {
+                    return Err(nom::Err::Failure(error_position!(
+                        i,
+                        // TODO
+                        nom::error::ErrorKind::Tag
+                    )));
+                };
+
+                if str.chars().count() != cells {
+                    return Err(nom::Err::Failure(error_position!(
+                        i,
+                        // TODO
+                        nom::error::ErrorKind::Tag
+                    )));
+                }
+
+                Ok((i, CharacterData::Unicode(str)))
+            }
+            DataType::Utf16 => {
+                assert!(data_element_tag.data_byte_size % 2 == 0);
+
+                let mut str = String::with_capacity(data_element_tag.data_byte_size as usize);
+                let u16 = u16::<&[u8], nom::error::Error<&[u8]>>(endianness);
+                let mut rem = buf;
+
+                let mut iter = char::decode_utf16(std::iter::from_fn(|| {
+                    let (r, ch) = u16(rem).ok()?;
+                    rem = r;
+                    Some(ch)
+                }));
+
+                for _ in 0..cells {
+                    let Some(Ok(ch)) = iter.next() else {
+                        return Err(nom::Err::Failure(error_position!(
+                            i,
+                            // TODO
+                            nom::error::ErrorKind::Tag
+                        )));
+                    };
+
+                    str.push(ch);
+                }
+
+                eof(rem)?;
+
+                str.shrink_to_fit();
+                Ok((i, CharacterData::Unicode(str)))
+            }
+            DataType::Utf32 => {
+                assert!(data_element_tag.data_byte_size % 4 == 0);
+
+                let mut str = String::with_capacity(data_element_tag.data_byte_size as usize);
+                let u32 = u32(endianness);
+                let mut rem = buf;
+
+                for _ in 0..cells {
+                    let (r, ch) = u32(rem)?;
+
+                    let Some(ch) = char::from_u32(ch) else {
+                        return Err(nom::Err::Failure(error_position!(
+                            i,
+                            // TODO
+                            nom::error::ErrorKind::Tag
+                        )));
+                    };
+
+                    rem = r;
+                    str.push(ch);
+                }
+
+                eof(rem)?;
+
+                str.shrink_to_fit();
+                Ok((i, CharacterData::Unicode(str)))
+            }
+            _ => Err(nom::Err::Failure(error_position!(
+                i,
+                // TODO
+                nom::error::ErrorKind::Tag
+            ))),
+        }
     }
 }
 
