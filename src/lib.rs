@@ -65,6 +65,7 @@ use std::convert::{TryFrom, TryInto};
 #[macro_use]
 extern crate enum_primitive_derive;
 
+mod data;
 #[cfg(feature = "ndarray")]
 pub mod ndarray;
 mod parse;
